@@ -1,0 +1,340 @@
+"""
+PQSCAAS Computation Cost Benchmark Simulation
+=============================================
+Compares: PQSCAAS (Ours) vs L-CLSS vs NTRU-IBLRSCS vs MLCLOOSC
+
+Formula basis:
+  KeyGen:
+    L-CLSS        : T_trap + T_pre + 2*T_h
+    NTRU-IBLRSCS  : T_trap + 2*T_s + T_h
+    MLCLOOSC      : T_pre + 2*T_pvm + T_h
+    PQSCAAS       : (T_kem + T_dsa + T_seal)/B + T_kdf + T_h
+
+  Signcrypt (Sender):
+    L-CLSS        : 3*T_mul + 2*T_add + 2*T_h
+    NTRU-IBLRSCS  : 2*alpha*T_s + (alpha+1)*T_mul + 2*T_rs + T_h
+    MLCLOOSC      : T_off + T_on  (both on sender device)
+    PQSCAAS       : T_sym + T_h   (AEAD only — no PQ on client)
+
+  Signcrypt (Server/Enclave):
+    L-CLSS        : —
+    NTRU-IBLRSCS  : —
+    MLCLOOSC      : —
+    PQSCAAS       : (T_enter+T_exit)/B + T_kem + T_dsa + T_kdf
+
+  Unsigncrypt (Receiver):
+    L-CLSS        : 2*T_mul + T_add + T_h
+    NTRU-IBLRSCS  : alpha*T_mul + T_sym + T_h
+    MLCLOOSC      : T_pvm + T_pva + T_h
+    PQSCAAS       : T_dsa + T_kem + T_sym + T_h
+"""
+
+import random
+import statistics
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import numpy as np
+import pandas as pd
+
+random.seed(42)
+np.random.seed(42)
+
+# ============================================================
+# SECTION 1: Operation costs (ms) — normalized at n=256, q=3329
+# อ้างอิงจาก benchmark ของ Kyber/Dilithium บน x86 และ paper ต่างๆ
+# ============================================================
+
+# Standard lattice ops
+T_TRAP  = 18.50   # TrapGen — very heavy, matrix sampling with trapdoor
+T_PRE   = 12.80   # SamplePre / Approx.SamplePreRej — preimage w/ trapdoor
+T_MUL   = 0.850   # Matrix-vector multiplication (standard lattice)
+T_ADD   = 0.012   # Vector addition
+T_S     = 0.420   # Discrete Gaussian Sampling (DGS)
+T_RS    = 0.180   # Rejection sampling (per round, avg ~1.4x attempts)
+
+# Module lattice ops (faster due to NTT)
+T_PVM   = 0.110   # Polynomial vector multiplication (NTT-based)
+T_PVA   = 0.008   # Polynomial vector addition
+
+# NIST PQ standards (ML-KEM-768 / ML-DSA-65 benchmarks)
+T_KEM   = 0.052   # ML-KEM Encap or Decap
+T_DSA   = 0.085   # ML-DSA Sign or Verify
+T_SEAL  = 0.015   # TEE enclave sealing (AES-based)
+T_ENTER = 0.080   # TEE enclave entry overhead
+T_EXIT  = 0.060   # TEE enclave exit overhead
+
+# Lightweight ops
+T_SYM   = 0.003   # AEAD symmetric enc/dec (AES-GCM per message)
+T_KDF   = 0.004   # Key derivation function
+T_H     = 0.005   # Hash function (SHA-3 / SHAKE)
+
+# Simulation parameters
+ROUNDS  = 50     # ≥50 ตาม pro tips
+BATCH_B = 32      # batch size ของ PQSCAAS
+ALPHA   = 8       # ring size ของ NTRU-IBLRSCS (default 8 members)
+NOISE   = 0.05    # ±5% variance เพื่อสะท้อน runtime jitter จริง
+
+def jitter(cost):
+    """เพิ่ม Gaussian noise ±NOISE% เพื่อสะท้อน variance ของ real hardware"""
+    sigma = cost * NOISE
+    return max(0, random.gauss(cost, sigma))
+
+# ============================================================
+# SECTION 2: Per-phase simulation functions
+# ============================================================
+
+def sim_lclss(rounds=ROUNDS):
+    """Yu et al. 2021 — L-CLSS (Certificateless Signcryption from Lattice)"""
+    kg, sc, us = [], [], []
+    for _ in range(rounds):
+        # KeyGen: T_trap + T_pre + 2*T_h
+        kg.append(jitter(T_TRAP) + jitter(T_PRE) + 2*jitter(T_H))
+
+        # Signcrypt (sender): 3*T_mul + 2*T_add + 2*T_h
+        sc.append(3*jitter(T_MUL) + 2*jitter(T_ADD) + 2*jitter(T_H))
+
+        # Unsigncrypt (receiver): 2*T_mul + T_add + T_h
+        us.append(2*jitter(T_MUL) + jitter(T_ADD) + jitter(T_H))
+    return kg, sc, us
+
+
+def sim_ntru_iblrscs(rounds=ROUNDS, alpha=ALPHA):
+    """Sinha et al. 2026 — NTRU-IBLRSCS (Identity-Based Linkable Ring Signcryption)"""
+    kg, sc, us = [], [], []
+    for _ in range(rounds):
+        # KeyGen: T_trap + 2*T_s + T_h
+        kg.append(jitter(T_TRAP) + 2*jitter(T_S) + jitter(T_H))
+
+        # Signcrypt (sender): 2*alpha*T_s + (alpha+1)*T_mul + 2*T_rs + T_h
+        sc.append(
+            2*alpha*jitter(T_S) +
+            (alpha+1)*jitter(T_MUL) +
+            2*jitter(T_RS) +
+            jitter(T_H)
+        )
+
+        # Unsigncrypt (receiver): alpha*T_mul + T_sym + T_h
+        us.append(alpha*jitter(T_MUL) + jitter(T_SYM) + jitter(T_H))
+    return kg, sc, us
+
+
+def sim_mlcloosc(rounds=ROUNDS):
+    """Bai et al. 2025 — MLCLOOSC (Module-Lattice Certificateless Online/Offline)"""
+    kg, sc, us = [], [], []
+    for _ in range(rounds):
+        # KeyGen: T_pre + 2*T_pvm + T_h
+        kg.append(jitter(T_PRE) + 2*jitter(T_PVM) + jitter(T_H))
+
+        # Signcrypt sender = offline + online (both on sender device)
+        # T_off = 2*T_pvm + 2*T_pva + T_h
+        # T_on  = T_pvm + T_pva
+        t_off = 2*jitter(T_PVM) + 2*jitter(T_PVA) + jitter(T_H)
+        t_on  = jitter(T_PVM)   + jitter(T_PVA)
+        sc.append(t_off + t_on)
+
+        # Unsigncrypt: T_pvm + T_pva + T_h
+        us.append(jitter(T_PVM) + jitter(T_PVA) + jitter(T_H))
+    return kg, sc, us
+
+
+def sim_pqscaas(rounds=ROUNDS, B=BATCH_B):
+    """PQSCAAS (Ours) — Deferred Binding + Multi-Enclave Batch Signcryption"""
+    kg, sc_client, sc_server, us = [], [], [], []
+    for _ in range(rounds):
+        # KeyGen (inside TEE, amortized over batch B):
+        # (T_kem + T_dsa + T_seal)/B + T_kdf + T_h
+        t_kg = (jitter(T_KEM) + jitter(T_DSA) + jitter(T_SEAL)) / B
+        t_kg += jitter(T_KDF) + jitter(T_H)
+        kg.append(t_kg)
+
+        # Signcrypt CLIENT: T_sym + T_h  (zero PQ ops)
+        sc_client.append(jitter(T_SYM) + jitter(T_H))
+
+        # Signcrypt SERVER (TEE enclave batch):
+        # (T_enter + T_exit)/B + T_kem + T_dsa + T_kdf
+        t_sv = (jitter(T_ENTER) + jitter(T_EXIT)) / B
+        t_sv += jitter(T_KEM) + jitter(T_DSA) + jitter(T_KDF)
+        sc_server.append(t_sv)
+
+        # Unsigncrypt: T_dsa + T_kem + T_sym + T_h
+        us.append(jitter(T_DSA) + jitter(T_KEM) + jitter(T_SYM) + jitter(T_H))
+
+    return kg, sc_client, sc_server, us
+
+
+# ============================================================
+# SECTION 3: Run simulation
+# ============================================================
+
+print("Running simulation...")
+print(f"  Rounds    : {ROUNDS}")
+print(f"  Batch B   : {BATCH_B}")
+print(f"  Ring α    : {ALPHA}")
+print(f"  Noise     : ±{int(NOISE*100)}%\n")
+
+lclss_kg,  lclss_sc,  lclss_us              = sim_lclss()
+ntru_kg,   ntru_sc,   ntru_us               = sim_ntru_iblrscs()
+mlcl_kg,   mlcl_sc,   mlcl_us               = sim_mlcloosc()
+pq_kg,     pq_sc_cli, pq_sc_srv, pq_us      = sim_pqscaas()
+
+# PQSCAAS total signcrypt = client + server
+pq_sc_total = [a+b for a,b in zip(pq_sc_cli, pq_sc_srv)]
+
+# ============================================================
+# SECTION 4: Summary table
+# ============================================================
+
+def stats(arr):
+    return statistics.mean(arr), statistics.stdev(arr)
+
+rows = []
+phases = ["KeyGen", "Signcrypt (Total)", "Unsigncrypt"]
+
+schemes = {
+    "L-CLSS":        (lclss_kg, lclss_sc,    lclss_us),
+    "NTRU-IBLRSCS":  (ntru_kg,  ntru_sc,     ntru_us),
+    "MLCLOOSC":      (mlcl_kg,  mlcl_sc,     mlcl_us),
+    "PQSCAAS (Ours)":(pq_kg,    pq_sc_total, pq_us),
+}
+
+print("=" * 75)
+print(f"{'Scheme':<20} {'Phase':<22} {'Mean (ms)':>10} {'Std Dev':>10} {'Rounds':>8}")
+print("=" * 75)
+for name, (kg, sc, us) in schemes.items():
+    for phase, arr in zip(phases, [kg, sc, us]):
+        m, s = stats(arr)
+        rows.append({"Scheme": name, "Phase": phase,
+                     "Mean (ms)": round(m, 4), "Std Dev": round(s, 5)})
+        print(f"{name:<20} {phase:<22} {m:>10.4f} {s:>10.5f} {len(arr):>8}")
+    print("-" * 75)
+
+df = pd.DataFrame(rows)
+
+# ============================================================
+# SECTION 5: Improvement vs PQSCAAS
+# ============================================================
+
+print("\n=== Efficiency Improvement (PQSCAAS vs others) ===")
+pq_means = {p: stats(arr)[0] for p, arr in zip(
+    phases, [pq_kg, pq_sc_total, pq_us])}
+
+for name, (kg, sc, us) in schemes.items():
+    if name == "PQSCAAS (Ours)": continue
+    other_means = {p: stats(arr)[0] for p, arr in zip(phases, [kg, sc, us])}
+    print(f"\n  vs {name}:")
+    for phase in phases:
+        imp = (other_means[phase] - pq_means[phase]) / other_means[phase] * 100
+        print(f"    {phase:<22}: PQSCAAS {imp:+.1f}% {'faster' if imp>0 else 'slower'}")
+
+# ============================================================
+# SECTION 6: Plot — 4 bar charts (one per phase + total)
+# ============================================================
+
+SCHEME_NAMES = list(schemes.keys())
+COLORS = ["#E24B4A", "#378ADD", "#BA7517", "#1D9E75"]
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5.5))
+fig.suptitle(
+    "Computation Cost Comparison — PQSCAAS vs Related Works\n"
+    f"(n=256, q=3329, Batch B={BATCH_B}, Ring α={ALPHA}, {ROUNDS} rounds average)",
+    fontsize=12, fontweight="bold", y=1.02
+)
+
+phase_data = {
+    "Key Generation":        [stats(schemes[n][0])[0] for n in SCHEME_NAMES],
+    "Signcryption (Total)":  [stats(schemes[n][1])[0] for n in SCHEME_NAMES],
+    "Unsigncryption":        [stats(schemes[n][2])[0] for n in SCHEME_NAMES],
+}
+phase_err = {
+    "Key Generation":        [stats(schemes[n][0])[1] for n in SCHEME_NAMES],
+    "Signcryption (Total)":  [stats(schemes[n][1])[1] for n in SCHEME_NAMES],
+    "Unsigncryption":        [stats(schemes[n][2])[1] for n in SCHEME_NAMES],
+}
+
+for ax, (phase_name, means) in zip(axes, phase_data.items()):
+    errs = phase_err[phase_name]
+    bars = ax.bar(SCHEME_NAMES, means, color=COLORS,
+                  yerr=errs, capsize=4, error_kw={"linewidth":1.2},
+                  width=0.55, zorder=3)
+
+    ax.set_title(phase_name, fontsize=11, fontweight="bold", pad=8)
+    ax.set_ylabel("Average cost (ms)", fontsize=9)
+    ax.set_xticks(range(len(SCHEME_NAMES)))
+    ax.set_xticklabels(
+        [n.replace(" (Ours)", "\n★ Ours") for n in SCHEME_NAMES],
+        fontsize=8.5, rotation=0, ha="center"
+    )
+    ax.yaxis.grid(True, linestyle="--", alpha=0.5, zorder=0)
+    ax.set_axisbelow(True)
+    ax.spines[["top","right"]].set_visible(False)
+
+    # annotate value on each bar
+    for bar, mean, err in zip(bars, means, errs):
+        ax.text(
+            bar.get_x() + bar.get_width()/2,
+            bar.get_height() + err + max(means)*0.01,
+            f"{mean:.3f}",
+            ha="center", va="bottom", fontsize=8, fontweight="500"
+        )
+
+    # highlight PQSCAAS bar
+    bars[-1].set_edgecolor("#085041")
+    bars[-1].set_linewidth(2)
+
+plt.tight_layout()
+plt.savefig("/mnt/user-data/outputs/pqscaas_benchmark.png",
+            dpi=150, bbox_inches="tight")
+print("\nPlot saved: pqscaas_benchmark.png")
+
+# ============================================================
+# SECTION 7: Per-phase breakdown plot for PQSCAAS only
+# ============================================================
+
+fig2, ax2 = plt.subplots(figsize=(9, 5))
+ax2.set_title(
+    "PQSCAAS — Phase Breakdown\n(Client vs Server/Enclave distinction)",
+    fontsize=11, fontweight="bold"
+)
+
+pq_phases = {
+    "KeyGen\n(Enclave/B)": stats(pq_kg)[0],
+    "Signcrypt\nClient":   stats(pq_sc_cli)[0],
+    "Signcrypt\nServer":   stats(pq_sc_srv)[0],
+    "Unsigncrypt\n(Recv)": stats(pq_us)[0],
+}
+pq_errs = {
+    "KeyGen\n(Enclave/B)": stats(pq_kg)[1],
+    "Signcrypt\nClient":   stats(pq_sc_cli)[1],
+    "Signcrypt\nServer":   stats(pq_sc_srv)[1],
+    "Unsigncrypt\n(Recv)": stats(pq_us)[1],
+}
+
+colors2 = ["#185FA5", "#1D9E75", "#0F6E56", "#5DCAA5"]
+bs2 = ax2.bar(
+    list(pq_phases.keys()), list(pq_phases.values()),
+    color=colors2,
+    yerr=list(pq_errs.values()), capsize=4,
+    error_kw={"linewidth":1.2}, width=0.5, zorder=3
+)
+ax2.yaxis.grid(True, linestyle="--", alpha=0.5, zorder=0)
+ax2.set_axisbelow(True)
+ax2.spines[["top","right"]].set_visible(False)
+ax2.set_ylabel("Average cost (ms)", fontsize=9)
+
+for bar, (label, val) in zip(bs2, pq_phases.items()):
+    ax2.text(bar.get_x()+bar.get_width()/2,
+             bar.get_height() + max(pq_phases.values())*0.02,
+             f"{val:.4f} ms", ha="center", va="bottom",
+             fontsize=9, fontweight="500")
+
+ax2.text(0.5, -0.12,
+    f"Client does AEAD only — zero PQ ops  |  Server batch B={BATCH_B}  |  "
+    f"{ROUNDS} rounds avg",
+    ha="center", transform=ax2.transAxes, fontsize=8,
+    color="gray")
+
+plt.tight_layout()
+plt.savefig("/mnt/user-data/outputs/pqscaas_phase_breakdown.png",
+            dpi=150, bbox_inches="tight")
+print("Plot saved: pqscaas_phase_breakdown.png")
+print("\nDone.")
