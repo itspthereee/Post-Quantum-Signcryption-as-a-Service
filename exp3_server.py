@@ -1,162 +1,138 @@
 """
-exp3_server.py — คนที่ 3 : Signcryption — Server / Enclave Side
-=================================================================
-รับผิดชอบ: วัด computation cost ของ Server-side Signcryption
+exp3_server.py — คนที่ 3 : Signcryption — Total Cost per Request vs Load
+X-axis : Number of requests (100, 200, 400, 800, 1600)
+Y-axis : Total signcrypt cost per request (ms)
 
-NOTE: L-CLSS, NTRU-IBLRSCS, MLCLOOSC ไม่มี server-side phase
-      มีแค่ PQSCAAS เท่านั้นที่ offload PQ ops ไป TEE enclave
-
-Formula:
-  L-CLSS        : — (N/A)
-  NTRU-IBLRSCS  : — (N/A)
-  MLCLOOSC      : — (N/A, offline phase ยังอยู่บน sender device)
-  PQSCAAS       : (T_enter + T_exit)/B + T_kem + T_dsa + T_kdf
-
-Graph: เปรียบเทียบ PQSCAAS server cost vs effective total cost ของ scheme อื่น
-       เพื่อแสดงว่าแม้แต่ server cost ของ PQSCAAS ก็ยังต่ำกว่า
-
-รัน: python exp3_server.py
-ผลลัพธ์: results/server_results.csv + results/server_plot.png
+สิ่งที่กราฟแสดง:
+  - L-CLSS / NTRU / MLCLOOSC: ทำ signcrypt เองทั้งหมด ไม่มี batching
+    → cost ต่อ request คงที่ ไม่ลดลง = เส้นราบ
+  - PQSCAAS: client ทำแค่ AEAD + server amortize ด้วย batch B
+    → ยิ่ง request เยอะ ยิ่ง amortize ได้มาก = เส้นลดลงแล้วคงที่
+    → total per-request cost ต่ำกว่าทุก scheme ตลอด
 """
-
-import random
-import statistics
-import os
-import json
+import random, statistics, os, json
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
+import matplotlib.ticker as mticker
 import pandas as pd
 from config import *
 
 random.seed(SEED)
 os.makedirs("results", exist_ok=True)
 
-PHASE = "Signcryption (Server/Enclave)"
+PHASE    = "Signcryption — Total Cost per Request"
+X_LABEL  = "Number of requests"
+X_VALUES = [1, 4, 8, 16, 32, 64, 128, 256, 512]
 
-def jitter(cost):
-    return max(0, random.gauss(cost, cost * NOISE))
+T_AEAD_PER_KB = 0.0012
+FILE_SIZE_KB  = 100      # fixed file size for this comparison
 
-# ─────────────────────────────────────────────────────────────
-def server_pqscaas(batch_size=B):
-    """
-    PQSCAAS (Ours) — TEE Enclave Batch Processing
-    Steps:
-      1. s_u = Unseal(S_u)                             : ~0 (AES)
-      2. (C_KEM, K') ← ML-KEM.Encap(PK^KEM_r)         : T_kem
-      3. K_bind = KDF(K || K')                         : T_kdf
-      4. sigma ← ML-DSA.Sign(H(CT)||C_KEM||AAD)        : T_dsa
-      ★ amortize T_enter+T_exit over batch B            : /B
-    Total per request: (T_enter+T_exit)/B + T_kem + T_dsa + T_kdf
-    """
-    results = []
-    for _ in range(ROUNDS):
-        amortized = (jitter(T_ENTER) + jitter(T_EXIT)) / batch_size
-        cost = amortized + jitter(T_KEM) + jitter(T_DSA) + jitter(T_KDF)
-        results.append(cost)
-    return results
+def jitter(c): return max(0, random.gauss(c, c*NOISE))
 
-def server_none():
-    """ไม่มี server phase — return 0 ทุก round"""
-    return [0.0] * ROUNDS
+# ── scheme อื่น: ทำ signcrypt ทุกอย่างเอง ไม่มี batch ──────
+def total_lclss(_n_req):
+    return 3*jitter(T_MUL) + 2*jitter(T_ADD) + 2*jitter(T_H) + FILE_SIZE_KB * jitter(T_AEAD_PER_KB)
 
-# ─────────────────────────────────────────────────────────────
+def total_ntru(_n_req):
+    return (2*ALPHA*jitter(T_S) + (ALPHA+1)*jitter(T_MUL) +
+            2*jitter(T_RS) + jitter(T_H) + FILE_SIZE_KB * jitter(T_AEAD_PER_KB))
+
+def total_mlcl(_n_req):
+    t_off = 2*jitter(T_PVM) + 2*jitter(T_PVA) + jitter(T_H)
+    t_on  = jitter(T_PVM) + jitter(T_PVA)
+    return t_off + t_on + FILE_SIZE_KB * jitter(T_AEAD_PER_KB)
+
+# ── PQSCAAS: client (AEAD) + server (amortized batch) ────
+def total_pqscaas(n_req):
+    # client cost (ต่ำมาก)
+    t_client = jitter(T_SYM) + jitter(T_H) + FILE_SIZE_KB * jitter(T_AEAD_PER_KB)
+
+    # server: batch size = min(B, n_req)
+    # ยิ่ง n_req เยอะ → ยิ่งเต็ม batch → amortize ดีขึ้น
+    effective_b = min(B, n_req)
+    t_server = ((jitter(T_ENTER) + jitter(T_EXIT)) / effective_b
+                + jitter(T_KEM) + jitter(T_DSA) + jitter(T_KDF))
+
+    return t_client + t_server
+
+FNS = {
+    "L-CLSS":         total_lclss,
+    "NTRU-IBLRSCS":   total_ntru,
+    "MLCLOOSC":       total_mlcl,
+    "PQSCAAS (Ours)": total_pqscaas,
+}
+
 def run():
     print(f"{'='*60}")
     print(f"  Experiment 3 — {PHASE}")
-    print(f"  Rounds={ROUNDS}, n={N}, q={Q}, Batch B={B}")
+    print(f"  X = {X_LABEL}: {X_VALUES}")
+    print(f"  File size fixed = {FILE_SIZE_KB} KB, Batch B = {B}")
+    print(f"  Rounds = {ROUNDS}")
     print(f"{'='*60}\n")
 
-    data = {
-        "L-CLSS":        server_none(),
-        "NTRU-IBLRSCS":  server_none(),
-        "MLCLOOSC":      server_none(),
-        "PQSCAAS (Ours)":server_pqscaas(),
-    }
+    data  = {s: {r: [FNS[s](r) for _ in range(ROUNDS)] for r in X_VALUES} for s in SCHEMES}
+    means = {s: [statistics.mean(data[s][r]) for r in X_VALUES] for s in SCHEMES}
+    stds  = {s: [statistics.stdev(data[s][r]) for r in X_VALUES] for s in SCHEMES}
+
+    for s in SCHEMES:
+        for r, m, sd in zip(X_VALUES, means[s], stds[s]):
+            print(f"  {s:<20} {r:5d} req: {m:8.4f} ± {sd:.5f} ms/req")
+        print()
 
     rows = []
-    for scheme, values in data.items():
-        m = statistics.mean(values)
-        s = statistics.stdev(values) if any(v > 0 for v in values) else 0.0
-        rows.append({"Scheme": scheme, "Phase": PHASE,
-                     "Mean (ms)": round(m, 5), "Std Dev": round(s, 6),
-                     "Rounds": len(values)})
-        label = f"mean={m:.5f} ms   std={s:.6f}" if m > 0 else "N/A (no server phase)"
-        print(f"  {scheme:<20} {label}")
+    for s in SCHEMES:
+        for r, m, sd in zip(X_VALUES, means[s], stds[s]):
+            rows.append({"Scheme":s, "Phase":PHASE, X_LABEL:r,
+                         "Mean (ms/req)":round(m,5), "Std Dev":round(sd,6)})
+    pd.DataFrame(rows).to_csv("results/server_results.csv", index=False)
 
-    df = pd.DataFrame(rows)
-    df.to_csv("results/server_results.csv", index=False)
-    print(f"\n  Saved: results/server_results.csv")
+    raw = {s: {str(r): data[s][r] for r in X_VALUES} for s in SCHEMES}
+    with open("results/server_raw.json","w") as f:
+        json.dump({"x_values":X_VALUES,"x_label":X_LABEL,
+                   "phase":PHASE,"file_size_kb":FILE_SIZE_KB,"data":raw}, f)
 
-    # ── Plot 1: batch size sensitivity ────────────────────────
-    batch_sizes = [1, 4, 8, 16, 32, 64, 128]
-    batch_means = []
-    for bs in batch_sizes:
-        vals = server_pqscaas(batch_size=bs)
-        batch_means.append(statistics.mean(vals))
+    # ── Plot ────────────────────────────────────────────────
+    STYLES = [("L-CLSS","#d62728","o","-"),
+              ("NTRU-IBLRSCS","#1f77b4","s","--"),
+              ("MLCLOOSC","#ff7f0e","^",":"),
+              ("PQSCAAS (Ours)","#2ca02c","D","-.")]
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    fig, ax = plt.subplots(figsize=(7, 4.8))
+    for name, color, marker, ls in STYLES:
+        ax.errorbar(X_VALUES, means[name], yerr=stds[name],
+                    label=name, color=color, marker=marker,
+                    linestyle=ls, linewidth=1.8, markersize=5,
+                    capsize=4, elinewidth=1)
 
-    axes[0].plot(batch_sizes, batch_means,
-                 marker="o", color="#1D9E75", linewidth=2, markersize=6)
-    axes[0].set_title(
-        f"PQSCAAS Server Cost vs Batch Size B\n"
-        f"(n={N}, q={Q}, {ROUNDS} rounds)",
+    ax.set_title(
+        f"{PHASE}\n"
+        f"(n={N}, q={Q}, Batch B={B}, File={FILE_SIZE_KB} KB, {ROUNDS} rounds)",
         fontsize=11, fontweight="bold")
-    axes[0].set_xlabel("Batch size B", fontsize=10)
-    axes[0].set_ylabel("Average cost per request (ms)", fontsize=10)
-    axes[0].yaxis.grid(True, linestyle="--", alpha=0.5)
-    axes[0].set_axisbelow(True)
-    axes[0].spines[["top","right"]].set_visible(False)
-    for bx, by in zip(batch_sizes, batch_means):
-        axes[0].annotate(f"B={bx}\n{by:.3f}ms",
-                         xy=(bx, by), xytext=(6, 6),
-                         textcoords="offset points", fontsize=7.5,
-                         color="#085041")
+    ax.set_xlabel(X_LABEL, fontsize=10)
+    ax.set_ylabel("Total signcrypt cost per request (ms)", fontsize=10)
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xticks(X_VALUES)
+    ax.xaxis.set_major_formatter(mticker.ScalarFormatter())
+    ax.grid(True, which="both", linestyle="--", alpha=0.5)
+    ax.legend(fontsize=9, framealpha=0.9)
+    ax.spines[["top","right"]].set_visible(False)
 
-    # ── Plot 2: server cost vs total cost of others ───────────
-    other_totals = {
-        "L-CLSS\n(full signcrypt)":
-            statistics.mean([3*jitter(T_MUL)+2*jitter(T_ADD)+2*jitter(T_H)
-                             for _ in range(ROUNDS)]),
-        "NTRU-IBLRSCS\n(full signcrypt)":
-            statistics.mean([2*ALPHA*jitter(T_S)+(ALPHA+1)*jitter(T_MUL)+
-                             2*jitter(T_RS)+jitter(T_H)
-                             for _ in range(ROUNDS)]),
-        "MLCLOOSC\n(T_off+T_on)":
-            statistics.mean([2*jitter(T_PVM)+2*jitter(T_PVA)+jitter(T_H)+
-                             jitter(T_PVM)+jitter(T_PVA)
-                             for _ in range(ROUNDS)]),
-        "PQSCAAS\nServer only":
-            statistics.mean(server_pqscaas()),
-    }
-
-    labels = list(other_totals.keys())
-    vals   = list(other_totals.values())
-    bar_colors = [COLORS[0], COLORS[1], COLORS[2], COLORS[3]]
-
-    bars = axes[1].bar(labels, vals, color=bar_colors, width=0.5, zorder=3)
-    axes[1].set_title(
-        "PQSCAAS Server vs Sender Cost of Others\n"
-        "(even server-only cost is competitive)",
-        fontsize=11, fontweight="bold")
-    axes[1].set_ylabel("Average cost (ms)", fontsize=10)
-    axes[1].yaxis.grid(True, linestyle="--", alpha=0.5, zorder=0)
-    axes[1].set_axisbelow(True)
-    axes[1].spines[["top","right"]].set_visible(False)
-    for bar, v in zip(bars, vals):
-        axes[1].text(bar.get_x()+bar.get_width()/2,
-                     bar.get_height()+max(vals)*0.01,
-                     f"{v:.4f}", ha="center", va="bottom", fontsize=9)
-    bars[-1].set_edgecolor("#085041")
-    bars[-1].set_linewidth(2.5)
+    # annotate จุดที่ PQSCAAS เริ่ม amortize เต็มที่
+    b_full_idx = next((i for i,r in enumerate(X_VALUES) if r >= B), None)
+    if b_full_idx is not None:
+        r_at_b = X_VALUES[b_full_idx]
+        m_at_b = means["PQSCAAS (Ours)"][b_full_idx]
+        ax.annotate(f"Batch full\n(B={B})",
+                    xy=(r_at_b, m_at_b),
+                    xytext=(r_at_b*1.3, m_at_b*2.5),
+                    fontsize=8, color="#2ca02c",
+                    arrowprops=dict(arrowstyle="->", color="#2ca02c", lw=1))
 
     plt.tight_layout()
     plt.savefig("results/server_plot.png", dpi=150, bbox_inches="tight")
-    print(f"  Saved: results/server_plot.png")
+    plt.close()
+    print("  Saved: results/server_results.csv")
+    print("  Saved: results/server_raw.json")
+    print("  Saved: results/server_plot.png\n")
 
-    with open("results/server_raw.json", "w") as f:
-        json.dump({k: v for k, v in data.items()}, f)
-    print(f"  Saved: results/server_raw.json\n")
-
-if __name__ == "__main__":
-    run()
+if __name__ == "__main__": run()
