@@ -1,10 +1,13 @@
 """
-Experiment 2: Client Encryption (AEAD vs Signcryption)
+Experiment 3: Unsigncryption End-to-End Latency (Fair Comparison)
   X-axis: File size (1KB, 10KB, 100KB, 1MB, 10MB, 100MB)
-  Y-axis: Client computation cost (ms)
+  Y-axis: Unsigncryption computation cost (ms)
 
-PQSCAAS: Client does ONLY AEAD (no PQ) — deferred to server
-Baselines: Client does FULL signcryption (AEAD + PQ operations)
+PQSCAAS: Recipient unsigncryption cost (verification + AEAD decryption)
+Baselines: Client-side unsigncryption cost (verification + AEAD decryption)
+
+Fair comparison: measures unsigncryption performance across all schemes.
+PQSCAAS uses server-optimized PQ verification.
 """
 
 import numpy as np
@@ -16,6 +19,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pqscaas import scheme as pq
+from pqscaas import crypto_primitives as cp
 from baselines import sinha2026, yu2021, bai2025
 
 
@@ -37,22 +41,30 @@ def run():
                'Yu2021': [], 'Yu2021_std': [],
                'Bai2025': [], 'Bai2025_std': []}
 
+    # Pre-generate keys (sender and recipient)
+    pk_r_kem, sk_r_kem, _ = cp.ml_kem_keygen()  # Recipient keys
+    pk_u_sig, sk_u_sig, _ = cp.ml_dsa_keygen()  # Sender keys
+
     for size, label in FILE_SIZES:
-        print(f"[Exp 2] File size = {label}...")
+        print(f"[Exp 3] File size = {label}...")
         pq_runs, sinha_runs, yu_runs, bai_runs = [], [], [], []
 
         for trial in range(NUM_TRIALS):
-            np.random.seed(trial * 17 + size % 1000)
+            np.random.seed(trial * 19 + size % 1000)
             msg = os.urandom(size)
 
-            # PQSCAAS: AEAD-only (lightweight)
-            _, t = pq.phase3_client_encrypt(msg)
-            pq_runs.append(t)
+            # PQSCAAS: Recipient unsigncryption ==========
+            # First create signcrypted message
+            desc, _ = pq.phase3_client_encrypt(msg)
+            sc, _ = pq.phase4_server_signcrypt_single(desc, pk_r_kem, sk_u_sig)
+            # Now recipient unsigncrypts - phase5_decrypt returns only time (float)
+            t_unsig = pq.phase5_decrypt(sc, pk_u_sig, sk_r_kem)
+            pq_runs.append(t_unsig)
 
-            # Baselines: full signcrypt
-            sinha_runs.append(sinha2026.ntru_client_signcrypt(msg))
-            yu_runs.append(yu2021.lclss_client_signcrypt(msg))
-            bai_runs.append(bai2025.mlcloosc_client_signcrypt(msg))
+            # ========== Baselines: Unsigncryption ==========
+            sinha_runs.append(sinha2026.ntru_decrypt(size))
+            yu_runs.append(yu2021.lclss_decrypt(size))
+            bai_runs.append(bai2025.mlcloosc_decrypt(size))
 
         results['file_size_bytes'].append(size)
         results['file_size_label'].append(label)
@@ -74,7 +86,7 @@ def run():
 
 
 def plot(df, out_path):
-    fig, ax = plt.subplots(figsize=(8, 5.5))
+    fig, ax = plt.subplots(figsize=(10, 6))
     for name, marker, ls, color in [
         ('PQSCAAS',   'o', '-',  '#2E86AB'),
         ('Bai2025',   's', '--', '#A23B72'),
@@ -84,9 +96,9 @@ def plot(df, out_path):
                     marker=marker, linestyle=ls, color=color,
                     label=name, markersize=8, linewidth=2, capsize=4, capthick=1.5)
     ax.set_xscale('log'); ax.set_yscale('log')
-    ax.set_xlabel('File size', fontsize=12)
-    ax.set_ylabel('Client computation cost (ms)', fontsize=12)
-    ax.set_title('Exp 2: Client Encryption (AEAD vs Signcryption)',
+    ax.set_xlabel('File size', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Computation cost (ms)', fontsize=12, fontweight='bold')
+    ax.set_title('Exp 3: Unsigncryption Cost Comparison',
                  fontsize=13, fontweight='bold')
     ax.legend(loc='upper left', fontsize=11)
     ax.grid(True, which='both', ls='-', alpha=0.3)
@@ -104,7 +116,7 @@ if __name__ == "__main__":
     os.makedirs(os.path.join(base, 'figures'), exist_ok=True)
 
     df = run()
-    df.to_csv(os.path.join(base, 'results', 'exp2_client_encrypt.csv'), index=False)
-    plot(df, os.path.join(base, 'figures', 'exp2_client_encrypt.png'))
-    print(f"\n✓ Exp 2 complete.")
+    df.to_csv(os.path.join(base, 'results', 'exp3_unsigncryption_latency.csv'), index=False)
+    plot(df, os.path.join(base, 'figures', 'exp3_unsigncryption_latency.png'))
+    print(f"\n✓ Exp 3 complete.")
     print(df.to_string(index=False))
