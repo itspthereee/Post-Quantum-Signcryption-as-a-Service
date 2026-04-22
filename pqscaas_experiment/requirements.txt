@@ -1,0 +1,10 @@
+# Core dependencies (required)
+numpy>=1.20.0
+pandas>=1.3.0
+matplotlib>=3.4.0
+cryptography>=3.4.0
+
+# Optional: for REAL post-quantum cryptography
+# If this installs, experiments will use actual ML-KEM-768 and ML-DSA-65
+# If not available, experiments fall back to calibrated mock timings
+# liboqs-python
