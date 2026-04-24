@@ -1,0 +1,6 @@
+services:
+  postquantumsigncryptionasaservice:
+    image: postquantumsigncryptionasaservice
+    build:
+      context: .
+      dockerfile: ./Dockerfile

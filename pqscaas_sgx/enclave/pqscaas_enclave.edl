@@ -1,0 +1,99 @@
+/* pqscaas_enclave.edl
+ * EDL (Enclave Definition Language) for PQSCAAS SGX enclave.
+ * Defines ECALLs (untrusted→trusted) and OCALLs (trusted→untrusted).
+ *
+ * Build with: sgx_edger8r pqscaas_enclave.edl --trusted --untrusted
+ */
+
+enclave {
+    include "stdint.h"
+
+    /* Sealed state buffer size: sgx_sealed_data_t header (~560B) + 48B raw state */
+    /* We use 1024 bytes as a safe upper bound */
+    from "sgx_tstdc.edl" import *;
+    from "sgx_pthread.edl" import *;
+
+    trusted {
+
+        /* ---------------------------------------------------------------
+         * Calibration ECALLs — measure individual primitive costs
+         * --------------------------------------------------------------- */
+
+        /* Empty ECALL to measure pure entry+exit overhead */
+        public sgx_status_t ecall_noop();
+
+        /* Calibrate per-operation costs; returns means over n_samples */
+        public sgx_status_t ecall_calibrate_ops(
+            uint32_t n_samples,
+            [out] double *seal_ms,
+            [out] double *unseal_ms,
+            [out] double *sha256_ms,
+            [out] double *hkdf_ms,
+            [out] double *mock_kem_keygen_ms,
+            [out] double *mock_dsa_keygen_ms,
+            [out] double *mock_kem_encap_ms,
+            [out] double *mock_dsa_sign_ms
+        );
+
+        /* ---------------------------------------------------------------
+         * Phase 2: Key Generation
+         * --------------------------------------------------------------- */
+
+        /* Single-user keygen (1 enclave entry).
+         * Returns inner ops timing (excludes enter/exit measured outside). */
+        public sgx_status_t ecall_phase2_keygen_single(
+            [out] double *inner_ms
+        );
+
+        /* Batch keygen (1 enclave entry for batch_size users). */
+        public sgx_status_t ecall_phase2_keygen_batch(
+            uint32_t batch_size,
+            [out] double *inner_ms
+        );
+
+        /* ---------------------------------------------------------------
+         * Phase 4: Server Signcryption
+         * --------------------------------------------------------------- */
+
+        /* Single signcryption inside enclave.
+         * pk_r_kem: 1184 bytes (ML-KEM-768 public key, or random bytes in mock).
+         * Returns inner_ms = sum of all ops inside (unseal+HKDF+encap+sign+seal). */
+        public sgx_status_t ecall_phase4_signcrypt_single(
+            [in, count=1184] const uint8_t *pk_r_kem,
+            uint32_t file_size_bytes,
+            [out] double *inner_ms
+        );
+
+        /* Batch signcryption: single enclave entry for n_requests. */
+        public sgx_status_t ecall_phase4_signcrypt_batch(
+            uint32_t n_requests,
+            [in, count=1184] const uint8_t *pk_r_kem,
+            [out] double *inner_ms
+        );
+
+        /* ---------------------------------------------------------------
+         * Phase 6: Revocation
+         * --------------------------------------------------------------- */
+
+        /* Lazy revocation: SHA-256 per revoked user + one seal.
+         * Returns total inner_ms. */
+        public sgx_status_t ecall_phase6_lazy_revoke(
+            uint32_t n_revoked,
+            [out] double *inner_ms
+        );
+
+        /* Single user rebind cost (unseal + hash + HKDF + seal).
+         * Used analytically for non-lazy revocation. */
+        public sgx_status_t ecall_phase6_rebind_single(
+            [out] double *inner_ms
+        );
+    };
+
+    untrusted {
+        /* Trusted→untrusted: print a message */
+        void ocall_print([in, string] const char *msg);
+
+        /* Trusted→untrusted: get current wall-clock time in ms */
+        void ocall_get_time_ms([out] double *out_ms);
+    };
+};
